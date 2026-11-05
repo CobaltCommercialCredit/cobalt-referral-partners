@@ -176,6 +176,7 @@
       <select id="toolSwitcher" class="btn" style="cursor:pointer;">
         <option value="">Switch tool…</option>
         <option value="https://cobaltcommercialcredit.github.io/cobalt-hub/">🏠 Terminal</option>
+        <option value="https://cobaltcommercialcredit.github.io/cobalt-crm/">CRM</option>
         <option value="https://cobaltcommercialcredit.github.io/cobalt-prospect-engine/">CRE Cold Outreach</option>
         <option value="https://cobaltcommercialcredit.github.io/cobalt-debt-deals/">Pipeline</option>
         <option value="https://cobaltcommercialcredit.github.io/cobalt-slb-calculator/">SLB Calculator</option>
@@ -258,6 +259,56 @@
   var SUPABASE_URL = 'https://pdqywwxyibnapeytoalk.supabase.co';
   var SUPABASE_KEY = 'sb_publishable_gAk4DGF0YlBxFQkcO92reQ_cb9H91lQ';
   var REST = SUPABASE_URL + '/rest/v1';
+
+  // ---------- CRM link (shared spine: crm_companies / crm_contacts) ----------
+  var CRM_URL = 'https://cobaltcommercialcredit.github.io/cobalt-crm/';
+  function crmNorm(s){ return (s||'').toLowerCase().replace(/\b(inc|llc|ltd|corp|corporation|co|company|the)\b/g,'').replace(/[^a-z0-9]/g,''); }
+  function crmUid(p){ return p+':'+Date.now()+Math.random().toString(36).slice(2,7); }
+  function crmOpen(companyId){ window.open(CRM_URL+'?company='+encodeURIComponent(companyId), '_blank'); }
+  async function crmReq(method, path, body){
+    var res = await fetch(REST+path, { method:method, headers: sbHeaders(method==='GET'?{}:{ 'Prefer':'return=minimal' }), body: body?JSON.stringify(body):undefined });
+    if(!res.ok){ var t=''; try{ t=await res.text(); }catch(e){} throw new Error('CRM '+method+' failed '+res.status+' '+t.slice(0,120)); }
+    if(method!=='GET') return null;
+    return await res.json();
+  }
+  // Finds the company by name or the person by email/phone; creates whatever is missing. Returns ids.
+  async function crmEnsure(o){
+    var by = (state.session && state.session.email) || 'Unknown';
+    var key = crmNorm(o.name), email = (o.email||'').trim().toLowerCase(), phone = (o.phone||'').replace(/\D/g,'').slice(-10);
+    var companies = await crmReq('GET', '/crm_companies?select=id,name');
+    var co = null, ct = null;
+    if(email && /@/.test(email)){
+      var hits = await crmReq('GET', '/crm_contacts?select=id,company_id,email&email=ilike.'+encodeURIComponent(email));
+      if(hits && hits.length){ ct = hits[0]; if(ct.company_id) co = { id: ct.company_id }; }
+    }
+    if(!co && key){ for(var i=0;i<companies.length;i++){ if(crmNorm(companies[i].name)===key){ co = companies[i]; break; } } }
+    var createdCo = false;
+    if(!co){
+      co = { id: crmUid('co'), name: o.name || o.contactName || 'Unnamed', industry: o.industry||'', address: o.address||'', status: o.status||'Qualified',
+        owner: o.owner||'', source: o.source||'', linked_prospect_id: o.linkedProspectId||null, dedupe_key: key, created_by: by };
+      await crmReq('POST', '/crm_companies', [co]); createdCo = true;
+    }
+    if(!ct && (o.contactName || email || phone)){
+      if(!createdCo){
+        var people = await crmReq('GET', '/crm_contacts?select=id,first_name,last_name,phone,email&company_id=eq.'+encodeURIComponent(co.id));
+        var cn = (o.contactName||'').trim().toLowerCase();
+        for(var j=0;j<(people||[]).length;j++){
+          var p = people[j], full = ((p.first_name||'')+' '+(p.last_name||'')).trim().toLowerCase();
+          if((cn && full===cn) || (phone && (p.phone||'').replace(/\D/g,'').slice(-10)===phone)){ ct = p; break; }
+        }
+      }
+      if(!ct){
+        var nm = (o.contactName||'').replace(/,.*$/,'').trim().split(/\s+/);
+        ct = { id: crmUid('ct'), company_id: co.id, first_name: nm[0]||'', last_name: nm.slice(1).join(' '), email: /@/.test(email)?o.email.trim():'', phone: o.phone||'',
+          roles: o.roles||['Owner'], is_primary: createdCo, status: o.status||'Qualified', owner: o.owner||'', source: o.source||'', referral_partner_id: o.referralPartnerId||null,
+          dedupe_key: /@/.test(email)?email:null, created_by: by };
+        await crmReq('POST', '/crm_contacts', [ct]);
+      }
+    }
+    if(o.referralPartnerId && ct) await crmReq('PATCH', '/crm_contacts?id=eq.'+encodeURIComponent(ct.id), { referral_partner_id: o.referralPartnerId });
+    await crmReq('POST', '/crm_activities', [{ id: crmUid('act'), company_id: co.id, contact_id: ct?ct.id:null, type:'System', body: o.note || 'Linked from another Cobalt tool', owner: o.owner||'', created_by: by }]);
+    return { companyId: co.id, contactId: ct?ct.id:null, created: createdCo };
+  }
   var AUTH = SUPABASE_URL + '/auth/v1';
 
   function sbHeaders(extra){
@@ -306,7 +357,8 @@
     return {
       id: row.id, partnerName: row.partner_name, partnerType: row.partner_type, contactName: row.contact_name,
       phone: row.phone, email: row.email, assignedTo: row.assigned_to, status: row.status,
-      nextTouchDate: row.next_touch_date, lastTouchDate: row.last_touch_date, notesLog: row.notes_log || [], createdAt: row.created_at
+      nextTouchDate: row.next_touch_date, lastTouchDate: row.last_touch_date, notesLog: row.notes_log || [], createdAt: row.created_at,
+      crmCompanyId: row.crm_company_id || null, crmContactId: row.crm_contact_id || null
     };
   }
   async function fetchAllPartners(){
@@ -636,7 +688,7 @@
       var stClass = STATUS_CLASS[p.status] || 'st-Prospecting';
       html += '<tr data-id="'+p.id+'">';
       html += '<td><input type="checkbox" class="row-select" data-act="select"'+(state.selected[p.id]?' checked':'')+'></td>';
-      html += '<td><div class="partner-name" data-act="expandname" style="cursor:pointer;">'+esc(p.partnerName)+'</div></td>';
+      html += '<td><div class="partner-name" data-act="expandname" style="cursor:pointer;">'+esc(p.partnerName)+'</div>'+(p.crmContactId?'<div class="badge type" data-act="opencrm" style="cursor:pointer;margin-top:3px;" title="Open in the CRM">CRM ↗</div>':'')+'</td>';
       html += '<td>'+(p.partnerType?'<span class="badge type">'+esc(p.partnerType)+'</span>':'—')+'</td>';
       html += '<td><select class="status-select '+stClass+'" data-act="status">'+STATUSES.map(function(s){ return '<option'+(s===p.status?' selected':'')+'>'+s+'</option>'; }).join('')+'</select></td>';
       html += '<td>'+esc(p.contactName||'—')+'</td>';
@@ -650,6 +702,7 @@
       if(state.expanded[p.id]){
         html += '<tr class="notes-row" data-id="'+p.id+'"><td colspan="8">'+
           '<div style="font-size:12px;color:var(--ink);margin-bottom:10px;">'+(p.phone?('Phone: '+esc(p.phone)+'  '):'')+(p.email?('· Email: '+esc(p.email)):'')+'</div>'+
+          '<div style="margin-bottom:12px;">'+(p.crmContactId?'<button class="btn" data-act="opencrm">Open in CRM</button>':'<button class="btn" data-act="addcrm" title="Create or link this COI in the CRM">Add to CRM</button>')+'</div>'+
           '<div class="link-row">'+
             '<span style="font-size:12px;font-weight:600;">Link to CRE Cold Outreach:</span>'+
             '<div class="link-results" style="flex:1;min-width:200px;">'+
@@ -786,6 +839,27 @@
       var expandNameEl = tr.querySelector('[data-act="expandname"]');
       if(expandNameEl) expandNameEl.addEventListener('click', toggleExpand);
 
+      Array.prototype.forEach.call(tr.querySelectorAll('[data-act="opencrm"]'), function(b){ b.addEventListener('click', async function(e){
+        e.stopPropagation();
+        if(rec.crmCompanyId){ crmOpen(rec.crmCompanyId); return; }
+        try{ var c = await crmReq('GET', '/crm_contacts?select=company_id&id=eq.'+encodeURIComponent(rec.crmContactId)); if(c && c[0] && c[0].company_id){ crmOpen(c[0].company_id); return; } }catch(err){}
+        window.open(CRM_URL, '_blank'); toast('This COI has no company in the CRM; search the Contacts tab');
+      }); });
+      var addCrmBtn = tr.querySelector('[data-act="addcrm"]');
+      if(addCrmBtn) addCrmBtn.addEventListener('click', async function(){
+        addCrmBtn.disabled = true;
+        try{
+          var t = rec.partnerType || '';
+          var roles = ['COI'].concat(t==='Bank'?['Lender']:t.indexOf('CPA')>=0?['CPA']:t.indexOf('Attorney')>=0?['Attorney']:t.indexOf('Wealth')>=0?['Wealth advisor']:[]);
+          var org = (rec.partnerName||'').indexOf('/')>=0 ? rec.partnerName.split('/').slice(1).join('/').trim() : rec.partnerName;
+          var isPerson = (org||'').trim().toLowerCase() === (rec.contactName||'').trim().toLowerCase();
+          var r = await crmEnsure({ name: org, contactName: rec.contactName || rec.partnerName, phone: rec.phone, email: rec.email, owner: rec.assignedTo,
+            source: t==='Bank'?'Bank':'COI', status:'Partner', roles: roles, referralPartnerId: rec.id, note: 'Linked from Referral Partner Tracker' });
+          await patchPartnerRemote(rec.id, { crm_company_id: r.companyId, crm_contact_id: r.contactId });
+          rec.crmCompanyId = r.companyId; rec.crmContactId = r.contactId;
+          toast(r.created ? 'Added to CRM' : 'Linked to the existing CRM record'); renderTable();
+        }catch(e){ addCrmBtn.disabled = false; toast('CRM link failed: '+e.message); }
+      });
       var delBtn = tr.querySelector('[data-act="delete"]');
       if(delBtn) delBtn.addEventListener('click', async function(){
         if(!confirm('Delete '+rec.partnerName+' for everyone?')) return;
